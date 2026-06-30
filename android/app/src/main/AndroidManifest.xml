@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.yndronix">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- extractNativeLibs MUST be true: the musl loader ships as
+         lib/arm64-v8a/libyndld.so and has to be extracted to nativeLibraryDir
+         on disk so it can be execve()d (the one app-writable-by-none location
+         Android still permits execution from at targetSdk >= 29). -->
+    <application
+        android:allowBackup="false"
+        android:label="yndronix"
+        android:extractNativeLibs="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- specialUse: the service supervises an in-app SSH daemon; no standard
+             foregroundServiceType fits. This triggers a manual Play review. -->
+        <service
+            android:name=".YndService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Runs an on-device SSH server (sshd) so the user can open a terminal session into their own device over the local network." />
+        </service>
+    </application>
+</manifest>

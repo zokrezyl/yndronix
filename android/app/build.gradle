@@ -1,0 +1,83 @@
+apply plugin: 'com.android.application'
+
+// Release signing is read from android/keystore.properties (git-ignored) or the
+// matching env vars, so the upload key never lives in the repo. Absent both, the
+// release build is left unsigned (apksigner/Play App Signing can sign later).
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+def releaseStorePath = keystoreProperties['storeFile'] ?: System.getenv('YNDRONIX_KEYSTORE')
+
+android {
+    namespace 'com.yndronix'
+    compileSdkVersion 35
+
+    defaultConfig {
+        applicationId 'com.yndronix'
+        minSdkVersion 24
+        // targetSdk 35 meets Google Play's floor. The store binaries are musl
+        // and live in the writable data dir, which Android 10+ (targetSdk >= 29)
+        // forbids execve()-ing. We sidestep that by shipping the musl loader in
+        // nativeLibraryDir and running every data-dir binary through it (see
+        // YndService + bootstrap/ynss exec interception), so the target no longer
+        // has to stay at 28.
+        targetSdkVersion 35
+        versionCode 1
+        versionName '1.0'
+
+        // The relocated store is aarch64 only.
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    signingConfigs {
+        release {
+            if (releaseStorePath) {
+                storeFile file(releaseStorePath)
+                storePassword keystoreProperties['storePassword'] ?: System.getenv('YNDRONIX_KEYSTORE_PASSWORD')
+                keyAlias keystoreProperties['keyAlias'] ?: System.getenv('YNDRONIX_KEY_ALIAS')
+                keyPassword keystoreProperties['keyPassword'] ?: System.getenv('YNDRONIX_KEY_PASSWORD')
+            }
+        }
+    }
+
+    // store.tar.br is already brotli-compressed; don't let aapt deflate it again.
+    aaptOptions {
+        noCompress 'br'
+    }
+
+    // Legacy packaging keeps native libs extracted to nativeLibraryDir on disk
+    // (rather than page-mapped from the APK), which is required to execve the
+    // musl loader shipped as lib/arm64-v8a/libyndld.so.
+    packagingOptions {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            if (releaseStorePath) {
+                signingConfig signingConfigs.release
+            }
+        }
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    // Tar reader + brotli decompressor for the first-launch extraction.
+    implementation 'org.apache.commons:commons-compress:1.21'
+    implementation 'org.brotli:dec:0.1.2'
+}

@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+#
+# Build a single nixpkgs package inside the yndronix relocated-store container.
+#
+# Usage:
+#   build-tools/build-package [--android] <nixpkgs-attr> [extra nix-build args...]
+#
+#   (default)   native build for the host platform (x86_64-linux here)
+#   --android   cross-compile for the phone: aarch64 GLIBC
+#               (pkgsCross.aarch64-multiplatform = aarch64-unknown-linux-gnu).
+#               NOT the bionic/NDK target -- we want self-contained glibc
+#               closures that run on the Android kernel via the relocated store.
+#
+# The relocated Nix store is a real directory in your workspace:
+#   ./nixroot   <-- bind-mounted into the container at
+#               /data/data/com.yndronix/nix   (the on-device path)
+# Built packages are visible at ./nixroot/store/<hash>-<name>, plus a
+# convenience symlink (both resolve on the host):
+#   ./out/<name>            (native)
+#   ./out/<name>.aarch64    (--android)
+#
+# nix runs as root in the container but drops to nixbld users for builds; newly
+# created store paths are chowned back to your uid so the store stays yours.
+#
+# Overridable via env:
+#   YNDRONIX_IMAGE       (default: yndronix-build)
+#   YNDRONIX_STORE_DIR   (default: <repo>/nixroot)
+
+set -euo pipefail
+
+IMAGE="${YNDRONIX_IMAGE:-yndronix-build}"
+STORE_PREFIX="/data/data/com.yndronix/nix"
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+STORE_DIR="${YNDRONIX_STORE_DIR:-$repo_root/nixroot}"
+# Persisted nix HOME cache (URL->store-path map + tarball/git cache). Without
+# this, each --rm container has an ephemeral ~/.cache and re-fetches + re-
+# unpacks the nixpkgs channel tarball every single run.
+CACHE_DIR="${YNDRONIX_CACHE_DIR:-$repo_root/.nixcache}"
+
+android=0
+if [ "${1:-}" = "--android" ]; then
+    android=1
+    shift
+fi
+
+if [ "$#" -lt 1 ]; then
+    printf 'usage: %s [--android] <nixpkgs-attr> [extra nix-build args...]\n' "$0" >&2
+    printf '  e.g. %s hello\n' "$0" >&2
+    printf '       %s --android hello\n' "$0" >&2
+    exit 2
+fi
+attr="$1"
+shift
+
+# "nvim" is the binary name; the nixpkgs package attr is neovim-unwrapped
+# (the lean core editor, without the ruby/python/node provider wrappers).
+[ "$attr" = "nvim" ] && attr="neovim-unwrapped"
+
+if [ "$android" -eq 1 ]; then
+    android_arg=true
+    link_name="$attr.aarch64"
+    label="$attr  (android: aarch64 glibc cross)"
+else
+    android_arg=false
+    link_name="$attr"
+    label="$attr  (native)"
+fi
+
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    printf 'error: image "%s" not found. Build it first:\n' "$IMAGE" >&2
+    printf '  docker build -t %s bootstrap/docker\n' "$IMAGE" >&2
+    exit 1
+fi
+
+# Pre-create store/ and var/ on the host so the bind mount presents them at
+# t=0 (a bind mount, unlike a named volume, is NOT seeded from the image; an
+# empty dir would let nix's free-space statvfs race ahead of store creation).
+mkdir -p "$STORE_DIR/store" "$STORE_DIR/var/log/nix" "$repo_root/out" "$CACHE_DIR"
+uid="$(id -u)"
+gid="$(id -g)"
+
+printf '>> building %s  (store dir: %s)\n' "$label" "$STORE_DIR" >&2
+
+# Builds via bootstrap/docker/build.nix (carries the docbook.org ->
+# archive.docbook.org fetchurl overlay and the pkgsCross selection).
+docker run --rm \
+    --network host \
+    -v "$STORE_DIR:$STORE_PREFIX" \
+    -v "$repo_root:/work" \
+    -v "$CACHE_DIR:/root/.cache" \
+    -e BUILD_UID="$uid" -e BUILD_GID="$gid" \
+    -e ATTR="$attr" -e ANDROID_ARG="$android_arg" -e LINK_NAME="$link_name" \
+    "$IMAGE" \
+    sh -c '
+        set -e
+        out="$(nix-build /work/bootstrap/docker/build.nix \
+                 --argstr attr "$ATTR" --arg android "$ANDROID_ARG" \
+                 --keep-going \
+                 --cores 0 --max-jobs "$(nproc)" --no-out-link "$@")"
+        printf "\n>> STORE_OUT_PATH=%s\n" "$out"
+        mkdir -p /work/out
+        ln -sfn "../nixroot/store/$(basename "$out")" "/work/out/$LINK_NAME"
+        # Leave the store owned by root:nixbld (nix multi-user model) -- chowning
+        # store contents to the host user breaks build-user locking. Store paths
+        # are world-readable, so they stay fully inspectable. Only the convenience
+        # symlink under ./out is handed to the host user.
+        chown -h "$BUILD_UID:$BUILD_GID" "/work/out/$LINK_NAME" 2>/dev/null || true
+        printf ">> host path:        ./nixroot/store/%s\n" "$(basename "$out")"
+        printf ">> convenience link: ./out/%s\n" "$LINK_NAME"
+    ' sh "$@"
+
+printf '>> done: ./out/%s -> ./nixroot/store/...\n' "$link_name" >&2

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#
+# Produce the APK's baked store asset: android/app/src/main/assets/store.tar.br
+#
+# The relocated store + runit control plane (bundle/{nix,svc}) is tarred
+# (preserving symlinks + exec bits) and brotli-compressed. The app's first-launch
+# extraction has to run anyway (a Nix store has symlinks/exec-bits/hardlinks a
+# passive unzip can't recreate), so it brotli-decompresses in the same pass --
+# keeping the APK ~5x smaller. Unpacked into /data/data/com.yndronix on first
+# launch (Android has no install hook).
+#
+# Usage: build-tools/make-apk-assets
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+bundle="$repo_root/bundle"
+asset="$repo_root/android/app/src/main/assets/store.tar.br"
+pubkey="$repo_root/yndronix_test_ed25519.pub"
+quality="${YNDRONIX_BROTLI_QUALITY:-6}"
+
+command -v brotli >/dev/null 2>&1 || {
+    printf 'make-apk-assets: need the "brotli" CLI (e.g. nix-shell -p brotli, apt install brotli)\n' >&2
+    exit 1
+}
+
+# 1. (re)build the bundle: union closure + generated runit control plane.
+"$repo_root/build-tools/make-service-bundle"
+
+# 2. bake the test public key so `ssh -i yndronix_test_ed25519` works out of the
+#    box on the phone (drop your own key here for real use).
+if [ -f "$pubkey" ]; then
+    cp "$pubkey" "$bundle/svc/authorized_keys"
+    printf '>> baked authorized_keys from %s\n' "$(basename "$pubkey")" >&2
+else
+    printf '>> note: %s not found -- no authorized_keys baked (add one before SSH)\n' "$pubkey" >&2
+fi
+
+# 2b. Extract the musl loader into jniLibs as lib/arm64-v8a/libyndld.so, so the
+#     APK ships it in nativeLibraryDir. Android 10+ forbids execve() of files in
+#     the data dir but permits it from nativeLibraryDir; the loader (the store's
+#     own ld-musl-aarch64.so.1) then mmaps and runs the musl store binaries. It
+#     must be the EXACT loader the store was linked against, so we read bash's
+#     PT_INTERP and copy that file (falling back to any ld-musl in the closure).
+loader_jni="$repo_root/android/app/src/main/jniLibs/arm64-v8a/libyndld.so"
+bash_in_bundle="$(find "$bundle/nix/store" -path '*bash*/bin/bash' -type f 2>/dev/null | head -n1)"
+[ -n "$bash_in_bundle" ] || {
+    printf 'make-apk-assets: bash not found in the bundle closure (run make-service-bundle first)\n' >&2
+    exit 1
+}
+
+interp_dev=""
+if command -v readelf >/dev/null 2>&1; then
+    interp_dev="$(readelf -l "$bash_in_bundle" 2>/dev/null \
+        | sed -n 's/.*program interpreter: \(.*\)]$/\1/p' | head -n1)"
+fi
+if [ -n "$interp_dev" ]; then
+    # Map the on-device interp path back to its host location in the bundle.
+    loader_host="$(printf '%s\n' "$interp_dev" \
+        | sed "s|^/data/data/com.yndronix/nix|$bundle/nix|")"
+else
+    loader_host="$(find "$bundle/nix/store" -name 'ld-musl-aarch64.so.1' 2>/dev/null | head -n1)"
+fi
+[ -n "$loader_host" ] && [ -e "$loader_host" ] || {
+    printf 'make-apk-assets: could not locate the musl loader (ld-musl-aarch64.so.1)\n' >&2
+    exit 1
+}
+mkdir -p "$(dirname "$loader_jni")"
+cp -fL "$loader_host" "$loader_jni"   # -L: copy the real ELF, not the symlink
+chmod 644 "$loader_jni"
+printf '>> loader -> %s\n' "$loader_jni" >&2
+
+# 3. tar {nix,svc} preserving symlinks/modes, brotli-compress into the asset.
+mkdir -p "$(dirname "$asset")"
+printf '>> taring + brotli (-q %s) -> %s\n' "$quality" "$asset" >&2
+tar -C "$bundle" -cf - nix svc | brotli -q "$quality" -c > "$asset"
+
+printf '>> asset ready: %s\n' "$(ls -lh "$asset" | awk '{print $5, $9}')" >&2
+printf '>> build the release AAB:  build-tools/build-release-aab.sh   (needs Android SDK + JDK 11)\n' >&2

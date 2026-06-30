@@ -1,0 +1,467 @@
+#!/usr/bin/env bash
+#
+# Assemble a deployable Android bundle from the relocated aarch64 Nix store.
+#
+# It does two things:
+#   1. Extracts the runtime CLOSURE of a chosen set of android packages out of
+#      ./nixroot into ./bundle/nix/store  (a self-contained, nix-less tree that
+#      drops straight onto the phone at /data/data/com.yndronix/nix/store).
+#   2. Generates a runit-based control plane under ./bundle/svc that supervises
+#      services -- for now only sshd -- plus a first-launch init wrapper.
+#
+# On device the bundle extracts into /data/data/com.yndronix/ :
+#
+#   nix/store/...                 <- read-only closure (this script copies it)
+#   svc/init                      <- entry point (run through the glibc loader)
+#   svc/paths.env                 <- baked on-device absolute paths
+#   svc/launch.env                <- on-device store-bash path for the launcher
+#   svc/sv/sshd/run               <- runit service (foreground sshd)
+#   svc/sv/sshd/log/run           <- svlogd logger
+#   run/                          <- created at first launch (state, keys, users)
+#
+# The app launches it through the glibc loader shipped in nativeLibraryDir
+# (Android 10+ forbids execve() of app-data files; the loader mmaps them
+# instead -- see svc/launch.env):  <loader> <store-bash> svc/init . init then
+# synthesizes the user db (ynss LD_PRELOAD, at the real runtime UID), generates
+# host keys + a pubkey-only sshd_config, installs the baked authorized_keys,
+# then exec()s runsvdir to supervise the services. ynss also carries the exec
+# interceptor that reroutes every later data-dir exec through the loader.
+#
+# Run AFTER the listed packages are built (build-tools/build-package --android <attr>).
+
+set -euo pipefail
+
+# --- the android packages whose closures go into the bundle ------------------
+# Edit this list to add tools; each must already be built for android
+# (build-tools/build-package --android <attr>  ->  ./out/<attr>.aarch64).
+BUNDLE_PACKAGES=(
+    # service runtime
+    runit          # runsvdir / runsv / sv / svlogd -- the supervisor
+    openssh        # bin/sshd, ssh-keygen, libexec/sftp-server + sshd-session
+    ynss           # LD_PRELOAD shim -> resolve the yndronix user (musl-clean)
+    # shells + base userland
+    bash           # login shell + every run-script shebang
+    coreutils      # id, mkdir, cat, chmod, head, tr ... used by the scripts
+    # interactive tools (all musl-cross)
+    findutils      # find, xargs
+    gnugrep        # grep
+    gnused         # sed
+    less           # pager
+    which          # which
+    tmux           # terminal multiplexer
+    dnsutils       # dig, host, nslookup
+    neovim         # editor
+    zsh            # alternative shell (Src/sort.c built at -O0 to dodge a GCC-15 ICE)
+    clang          # C/C++ compiler (LLVM)
+)
+
+# Packages whose /bin should be on the session PATH (those that ship binaries).
+PATH_PACKAGES=(coreutils bash openssh runit findutils gnugrep gnused less which tmux dnsutils neovim zsh clang)
+
+SSH_PORT=8022
+
+# --- locations ---------------------------------------------------------------
+PREFIX=/data/data/com.yndronix/nix         # the on-device store prefix (FIXED:
+                                           # it is hashed into every store path)
+ROOT_DEV=/data/data/com.yndronix           # the app data-dir root on device
+
+IMAGE="${YNDRONIX_IMAGE:-yndronix-build}"
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+STORE_DIR="${YNDRONIX_STORE_DIR:-$repo_root/nixroot}"
+BUNDLE_DIR="${YNDRONIX_BUNDLE_DIR:-$repo_root/bundle}"
+
+die() { printf 'make-service-bundle: %s\n' "$*" >&2; exit 1; }
+
+# --- 1. resolve each package to its on-device store path ---------------------
+# We rely on the ./out/<attr>.aarch64 convenience links that build-package
+# creates, so this never triggers a surprise (possibly huge) build.
+declare -A PKG_DEV     # attr -> /data/data/com.yndronix/nix/store/<base>
+declare -A PKG_HOST    # attr -> ./nixroot/store/<base>   (for inspecting files)
+root_store_paths=()    # the closure roots, as on-device paths
+missing=()
+
+for attr in "${BUNDLE_PACKAGES[@]}"; do
+    link="$repo_root/out/$attr.aarch64"
+    if [ ! -L "$link" ]; then
+        missing+=("$attr")
+        continue
+    fi
+    base="$(basename "$(readlink -f "$link")")"
+    PKG_DEV[$attr]="$PREFIX/store/$base"
+    PKG_HOST[$attr]="$STORE_DIR/store/$base"
+    root_store_paths+=("$PREFIX/store/$base")
+done
+
+if [ "${#missing[@]}" -gt 0 ]; then
+    printf 'make-service-bundle: these packages are not built yet:\n' >&2
+    for attr in "${missing[@]}"; do printf '  build-tools/build-package --android %s\n' "$attr" >&2; done
+    exit 1
+fi
+
+# --- 2. closure extraction (inside the container, where nix lives) -----------
+# nix-store -qR gives the runtime closure of the roots; we copy each path that
+# is not already present, preserving the read-only 444/555 modes.
+# Clean BOTH nix/ and svc/ -- the closure copy below only copies paths "not
+# already present", so a stale nix/store from a previous (e.g. glibc) bundle
+# would otherwise linger and bloat/poison the asset. Start from empty.
+# nix/store paths are copied read-only (555 dirs), so restore the write bit
+# before rm can unlink them.
+rm -rf "$BUNDLE_DIR/svc"
+if [ -d "$BUNDLE_DIR/nix" ]; then
+    chmod -R u+w "$BUNDLE_DIR/nix" 2>/dev/null || true
+    rm -rf "$BUNDLE_DIR/nix"
+fi
+mkdir -p "$BUNDLE_DIR/nix/store" "$BUNDLE_DIR/svc/sv/sshd/log"
+
+printf '>> extracting closure of %d packages into %s/nix/store\n' \
+    "${#BUNDLE_PACKAGES[@]}" "$BUNDLE_DIR" >&2
+
+docker run --rm \
+    -v "$STORE_DIR:$PREFIX" \
+    -v "$repo_root:/work" \
+    -e BUILD_UID="$(id -u)" -e BUILD_GID="$(id -g)" \
+    -e ROOTS="${root_store_paths[*]}" \
+    "$IMAGE" \
+    sh -c '
+        set -e
+        nix-store -qR $ROOTS > /work/bundle/.closure
+        count=0
+        while IFS= read -r path; do
+            base="$(basename "$path")"
+            if [ ! -e "/work/bundle/nix/store/$base" ]; then
+                cp -a "$path" "/work/bundle/nix/store/$base"
+                count=$((count + 1))
+            fi
+        done < /work/bundle/.closure
+        total="$(wc -l < /work/bundle/.closure)"
+        printf ">> closure: %s paths (%s newly copied)\n" "$total" "$count"
+        # Hand the whole bundle back to the host user (it is a fresh tree, so
+        # chowning it is safe -- unlike the live store).
+        chown -R "$BUILD_UID:$BUILD_GID" /work/bundle
+    '
+
+# --- 2b. strip build-host (x86-64) paths from the closure --------------------
+# Cross builds leave a few wrapper SCRIPTS -- e.g. musl's musl-gcc / musl-clang /
+# ld.musl-clang in clang's closure -- whose #! line points at the BUILD-host
+# bash. On the relocated store that bash is x86-64 + glibc; it cannot run on the
+# phone and is the ONLY thing dragging a 35 MB x86-64 glibc (and its x86-64 dep
+# closure) in. So: repoint those shebangs at the target musl bash (which also
+# makes the wrappers actually runnable on-device -- they exec the aarch64 musl
+# gcc), then drop every x86-64 store path. clang and the whole package set are
+# kept; the shipped userland stays pure musl.
+musl_bash_dev="${PKG_DEV[bash]}/bin/bash"
+
+# x86-64 store dirs = anything whose ELFs request the x86-64 loader, plus any
+# glibc path. (The phone is aarch64; an x86-64 binary here is build-host junk.)
+x86_dirs="$( { grep -rla 'ld-linux-x86-64.so.2' "$BUNDLE_DIR/nix/store" 2>/dev/null || true; \
+               ls -d "$BUNDLE_DIR"/nix/store/*glibc* 2>/dev/null || true; } \
+    | sed -E "s#^$BUNDLE_DIR/nix/store/([^/]+).*#\1#" | sort -u )"
+
+if [ -n "$x86_dirs" ]; then
+    # Closure paths are copied read-only (555 dirs); make them writable so we can
+    # edit shebangs and remove paths. (On-device dir modes come from the
+    # installer's mkdir, not the tar, so this does not change the deployed tree.)
+    chmod -R u+w "$BUNDLE_DIR/nix/store" 2>/dev/null || true
+    # Repoint shebangs that point at an x86-64 bash to the target musl bash.
+    for dir in $x86_dirs; do
+        case "$dir" in
+            *bash*)
+                dev_path="$PREFIX/store/$dir"
+                while IFS= read -r script; do
+                    head -1 "$script" 2>/dev/null | grep -q "^#!$dev_path/" || continue
+                    sed -i "1s|^#!$dev_path/bin/[a-z]*|#!$musl_bash_dev|" "$script"
+                done < <(grep -rlI "$dev_path" "$BUNDLE_DIR/nix/store" 2>/dev/null || true)
+                ;;
+        esac
+    done
+    # Drop the x86-64 store paths (read-only 555 dirs -> restore write bit first).
+    for dir in $x86_dirs; do
+        chmod -R u+w "$BUNDLE_DIR/nix/store/$dir" 2>/dev/null || true
+        rm -rf "$BUNDLE_DIR/nix/store/$dir"
+    done
+    printf '>> stripped %s build-host (x86-64) store path(s) from the bundle\n' \
+        "$(printf '%s\n' $x86_dirs | grep -c .)" >&2
+fi
+
+# --- 2c. no-glibc guard ------------------------------------------------------
+# The whole point of the musl userland is that glibc CANNOT run in the Android
+# app sandbox (its rseq/statx/... syscalls are SIGSYS-killed). So ANY glibc
+# store path in the runtime closure is a cross-compilation contamination bug --
+# typically a package whose dev-wrapper shebangs point at the build-host bash,
+# dragging the host's x86-64 glibc in. Refuse to ship it; fail loudly instead.
+glibc_paths="$(ls "$BUNDLE_DIR/nix/store" 2>/dev/null | grep -i 'glibc' || true)"
+if [ -n "$glibc_paths" ]; then
+    {
+        printf '\nmake-service-bundle: REFUSING to build -- glibc in the runtime closure:\n'
+        printf '    %s\n' $glibc_paths
+        printf '\nThe musl userland must contain no glibc. Some bundle package is dragging a\n'
+        printf 'build-host toolchain. Find the puller with:\n'
+        printf '    grep -rlIa <glibc-store-hash> %s/nix/store | grep -v /<glibc-store-hash>/\n' "$BUNDLE_DIR"
+        printf 'then drop that package from BUNDLE_PACKAGES (or override it to not propagate\n'
+        printf 'the native toolchain), and rebuild.\n'
+    } >&2
+    exit 1
+fi
+
+# --- 3. resolve the concrete binaries we reference ---------------------------
+openssh="${PKG_DEV[openssh]}"
+runit="${PKG_DEV[runit]}"
+bash_bin="${PKG_DEV[bash]}/bin/bash"
+
+# ynss: our musl-clean getpw*/getgr* LD_PRELOAD shim (libynss.so).
+nss_host_lib="$(find "${PKG_HOST[ynss]}" -name 'libynss.so' -print -quit 2>/dev/null || true)"
+[ -n "$nss_host_lib" ] || die "libynss.so not found under ${PKG_HOST[ynss]}"
+nss_dev_lib="${nss_host_lib/$STORE_DIR/$PREFIX}"
+
+# Session PATH = every tool package's /bin (on-device paths).
+session_path=""
+for attr in "${PATH_PACKAGES[@]}"; do
+    bindir="${PKG_DEV[$attr]}/bin"
+    session_path="${session_path:+$session_path:}$bindir"
+done
+
+# --- 4. generate the control plane under svc/ --------------------------------
+# paths.env: fully-substituted, sourced by every script at runtime.
+cat > "$BUNDLE_DIR/svc/paths.env" <<EOF
+# Generated by make-service-bundle. On-device absolute paths -- do not edit.
+export YND_ROOT=$ROOT_DEV
+export YND_PREFIX=$PREFIX
+export YND_SVC=$ROOT_DEV/svc
+export YND_RUN=$ROOT_DEV/run
+
+export SSHD=$openssh/bin/sshd
+export SSH_KEYGEN=$openssh/bin/ssh-keygen
+export SFTP_SERVER=$openssh/libexec/sftp-server
+export RUNSVDIR=$runit/bin/runsvdir
+export SV=$runit/bin/sv
+export SVLOGD=$runit/bin/svlogd
+export NSS_WRAPPER_LIB=$nss_dev_lib
+export LOGIN_SHELL=$bash_bin
+export BASH=$bash_bin
+
+export SSH_PORT=$SSH_PORT
+export PATH=$session_path
+EOF
+
+# launch.env: the minimal facts the Android launcher (Java) needs to start the
+# supervisor through the nativeLibraryDir glibc loader. The loader must be handed
+# a real ELF, not the "#!" init script, so the launcher runs it as
+#   <nativeLibraryDir>/<LOADER>  <BASH>  <INIT>
+# Plain KEY=VALUE lines (parsed in Java, not sourced by a shell).
+cat > "$BUNDLE_DIR/svc/launch.env" <<EOF
+# Generated by make-service-bundle. On-device absolute paths -- do not edit.
+BASH=$bash_bin
+INIT=$ROOT_DEV/svc/init
+LOADER=libyndld.so
+EOF
+
+# init: the entry point. Shebang must be the absolute store bash (no /bin/sh on
+# Android); the body is literal (it sources paths.env at runtime).
+{
+    printf '#!%s\n' "$bash_bin"
+    cat <<'INIT_BODY'
+# yndronix service launcher -- first-launch init, then exec runsvdir.
+set -eu
+# PATH is not set yet (paths.env sets it on the next line), so we cannot rely on
+# external tools like dirname here. Pure-bash parameter expansion strips the
+# trailing /init to get our own directory ($0 is always the absolute init path).
+# Sourcing uses a literal slashed path, so no PATH search (no external command).
+self="${0%/*}"
+. "$self/paths.env"
+
+# Re-exec under the Android/musl compat preload (ynss) BEFORE running any
+# external command. Android's app seccomp kills faccessat2 (439) with SIGSYS,
+# which musl's access check (bash PATH search) uses; ynss shims it to the plain
+# faccessat syscall. LD_PRELOAD only takes effect at process start, so we must
+# set it then re-exec ourselves -- everything here (export, exec with the full
+# $BASH path) is a builtin or needs no PATH search. All children (runsvdir,
+# sshd, login shells) then inherit the shim. NSS_WRAPPER_* point ynss at the
+# user db this script writes below; the files need not exist yet (read lazily).
+if [ "${YND_PRELOADED:-}" != 1 ]; then
+    export YND_PRELOADED=1
+    export LD_PRELOAD="$NSS_WRAPPER_LIB"
+    export NSS_WRAPPER_PASSWD="$YND_RUN/etc/passwd"
+    export NSS_WRAPPER_GROUP="$YND_RUN/etc/group"
+    export TMPDIR="$YND_RUN/tmp"
+    # On Android 10+ (targetSdk >= 29) execve() of a file in the app data dir is
+    # denied; the launcher passes YND_LINKER = the glibc loader shipped in
+    # nativeLibraryDir (an execve-allowed path), and every data-dir exec must go
+    # through it. ynss (now LD_PRELOAD-active for the RE-EXEC'd child) reroutes
+    # all further execs automatically -- but THIS exec runs before the shim is
+    # loaded, so it must name the loader explicitly. When YND_LINKER is unset (a
+    # manual run, or a targetSdk <= 28 build) exec the store bash directly.
+    if [ -n "${YND_LINKER:-}" ]; then
+        exec "$YND_LINKER" "$BASH" "$0" "$@"
+    else
+        exec "$BASH" "$0" "$@"
+    fi
+fi
+
+uid="$(id -u)"; gid="$(id -g)"
+
+# run/tmp must exist before any here-document (bash writes heredocs to a temp
+# file under TMPDIR); it is the first thing we create.
+mkdir -p "$YND_RUN/tmp" "$YND_RUN/etc" "$YND_RUN/keys" "$YND_RUN/home/.ssh" \
+         "$YND_RUN/service" "$YND_RUN/log/sshd"
+chmod 700 "$YND_RUN/home" "$YND_RUN/home/.ssh"
+
+# --- synthesized user db for ynss ---
+# musl reads /etc/passwd directly and Android has none; ynss (LD_PRELOAD) answers
+# getpw*/getgr* from these files instead. The uid/gid MUST be the real runtime app
+# uid, otherwise sshd's drop-to-user fails. 'sshd' is the privilege-separation
+# account sshd looks up at startup. Field 2 is 'x' -- pubkey-only, no hash.
+cat > "$YND_RUN/etc/passwd" <<PASSWD
+yndronix:x:$uid:$gid:yndronix:$YND_RUN/home:$YND_RUN/login-shell
+sshd:x:$uid:$gid:sshd privsep:/var/empty:/bin/false
+PASSWD
+cat > "$YND_RUN/etc/group" <<GROUP
+yndronix:x:$gid:
+GROUP
+
+# DNS: musl reads /etc/resolv.conf, which can't exist on Android. ynss's
+# getaddrinfo() reads the nameserver from this file instead (first 'nameserver'
+# line; default 1.1.1.1). Edit to use a different resolver.
+cat > "$YND_RUN/etc/resolv.conf" <<RESOLV
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+RESOLV
+
+# Activate ynss for THIS process and every child. ssh-keygen, runsvdir and sshd
+# all call getpwuid()/getpwnam() to resolve the app uid to 'yndronix' -- on
+# Android there is no /etc/passwd, so only ynss answers. (After passwd/group.)
+export LD_PRELOAD="$NSS_WRAPPER_LIB"
+export NSS_WRAPPER_PASSWD="$YND_RUN/etc/passwd"
+export NSS_WRAPPER_GROUP="$YND_RUN/etc/group"
+
+# sshd strips LD_PRELOAD from the session environment (security), so the login
+# shell would start WITHOUT the ynss compat shim and die on its first PATH search
+# (faccessat2 -> SIGSYS) or name lookup. The user's shell is therefore a tiny
+# wrapper: it re-establishes LD_PRELOAD/NSS_WRAPPER using only builtins (no PATH
+# search) and execs the real bash with the shim active. Every command run in the
+# session then inherits it. (passwd shell field above points here.)
+cat > "$YND_RUN/login-shell" <<SHELL
+#!$LOGIN_SHELL
+export LD_PRELOAD="$NSS_WRAPPER_LIB"
+export NSS_WRAPPER_PASSWD="$YND_RUN/etc/passwd"
+export NSS_WRAPPER_GROUP="$YND_RUN/etc/group"
+export TMPDIR="$YND_RUN/tmp"
+export TMUX_TMPDIR="$YND_RUN/tmp"
+# sshd does not pass YND_LINKER into the session env, so the loader path is
+# baked here at first-launch (init's runtime value). The session's first exec
+# (this real bash) runs before ynss reloads, so it must name the loader; once
+# bash is up with ynss active every later exec is rerouted automatically, and
+# the exported YND_LINKER lets ynss find the loader.
+export YND_LINKER="$YND_LINKER"
+if [ -n "\$YND_LINKER" ]; then
+    exec "\$YND_LINKER" "$LOGIN_SHELL" "\$@"
+else
+    exec "$LOGIN_SHELL" "\$@"
+fi
+SHELL
+chmod 755 "$YND_RUN/login-shell"
+
+# Interactive sub-shells also re-assert the shim via ~/.bash_profile (redundant
+# with the wrapper, but harmless and keeps PATH set for nested login shells).
+cat > "$YND_RUN/home/.bash_profile" <<PROFILE
+export LD_PRELOAD="$NSS_WRAPPER_LIB"
+export NSS_WRAPPER_PASSWD="$YND_RUN/etc/passwd"
+export NSS_WRAPPER_GROUP="$YND_RUN/etc/group"
+export TMPDIR="$YND_RUN/tmp"
+export TMUX_TMPDIR="$YND_RUN/tmp"
+export YND_LINKER="$YND_LINKER"
+export PATH="$PATH"
+PROFILE
+
+# Install a baked authorized_keys if the bundle shipped one, so pubkey login
+# works on a fresh deploy with no manual step.
+if [ -f "$YND_SVC/authorized_keys" ]; then
+    install -Dm600 "$YND_SVC/authorized_keys" "$YND_RUN/home/.ssh/authorized_keys"
+fi
+
+# --- host keys (generated once) ---
+if [ ! -f "$YND_RUN/keys/ssh_host_ed25519_key" ]; then
+    "$SSH_KEYGEN" -t ed25519 -f "$YND_RUN/keys/ssh_host_ed25519_key" -N "" -C yndronix >/dev/null
+fi
+
+# --- sshd config (pubkey only) ---
+# StrictModes no -> home/key perms under the app dir won't match sshd's checks.
+cat > "$YND_RUN/etc/sshd_config" <<SSHD_CONFIG
+Port $SSH_PORT
+ListenAddress 0.0.0.0
+HostKey $YND_RUN/keys/ssh_host_ed25519_key
+PidFile $YND_RUN/sshd.pid
+UsePAM no
+PasswordAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+StrictModes no
+AuthorizedKeysFile $YND_RUN/home/.ssh/authorized_keys
+Subsystem sftp $SFTP_SERVER
+PrintMotd no
+SetEnv PATH=$PATH
+SSHD_CONFIG
+
+# --- install/refresh the runit service dirs (keep any live supervise/ state) ---
+for template in "$YND_SVC"/sv/*/; do
+    name="$(basename "$template")"
+    mkdir -p "$YND_RUN/service/$name"
+    cp "$template/run" "$YND_RUN/service/$name/run"
+    chmod 755 "$YND_RUN/service/$name/run"
+    if [ -f "$template/log/run" ]; then
+        mkdir -p "$YND_RUN/service/$name/log"
+        cp "$template/log/run" "$YND_RUN/service/$name/log/run"
+        chmod 755 "$YND_RUN/service/$name/log/run"
+    fi
+done
+
+echo "yndronix: sshd on port $SSH_PORT  user 'yndronix'  (pubkey only)"
+# runsvdir saves its current directory at startup; the cwd inherited from the
+# Android app ("/") is not openable in the sandbox, so move to a dir we own.
+cd "$YND_RUN"
+exec "$RUNSVDIR" "$YND_RUN/service"
+INIT_BODY
+} > "$BUNDLE_DIR/svc/init"
+chmod 755 "$BUNDLE_DIR/svc/init"
+
+# sshd service: foreground sshd under nss_wrapper, output to the logger.
+{
+    printf '#!%s\n' "$bash_bin"
+    cat <<'SSHD_RUN'
+exec 2>&1
+. /data/data/com.yndronix/svc/paths.env
+exec env \
+    LD_PRELOAD="$NSS_WRAPPER_LIB" \
+    NSS_WRAPPER_PASSWD="$YND_RUN/etc/passwd" \
+    NSS_WRAPPER_GROUP="$YND_RUN/etc/group" \
+    "$SSHD" -D -e -f "$YND_RUN/etc/sshd_config"
+SSHD_RUN
+} > "$BUNDLE_DIR/svc/sv/sshd/run"
+chmod 755 "$BUNDLE_DIR/svc/sv/sshd/run"
+
+# sshd logger: timestamped logs under run/log/sshd/current.
+{
+    printf '#!%s\n' "$bash_bin"
+    cat <<'SSHD_LOG_RUN'
+. /data/data/com.yndronix/svc/paths.env
+exec "$SVLOGD" -tt "$YND_RUN/log/sshd"
+SSHD_LOG_RUN
+} > "$BUNDLE_DIR/svc/sv/sshd/log/run"
+chmod 755 "$BUNDLE_DIR/svc/sv/sshd/log/run"
+
+rm -f "$BUNDLE_DIR/.closure"
+
+# --- 5. summary --------------------------------------------------------------
+bundle_size="$(du -sh "$BUNDLE_DIR/nix/store" 2>/dev/null | cut -f1 || echo '?')"
+printf '\n>> bundle ready: %s  (store: %s)\n' "$BUNDLE_DIR" "$bundle_size"
+cat >&2 <<NOTE
+
+Deploy to the phone (app already owns /data/data/com.yndronix):
+  tar -C "$BUNDLE_DIR" -cf bundle.tar nix svc
+  # push bundle.tar to the device, then on device:
+  tar -C /data/data/com.yndronix -xpf bundle.tar
+  exec /data/data/com.yndronix/svc/init      # the app runs this (foreground)
+
+Control a running instance (from the app), e.g.:
+  SVDIR=/data/data/com.yndronix/run/service $runit/bin/sv restart sshd
+Login is pubkey-only; the baked authorized_keys lands in run/home/.ssh/.
+NOTE

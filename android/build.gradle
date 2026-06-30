@@ -1,0 +1,17 @@
+// Root build file. AGP 7.4.x pairs with Gradle 7.5+ and JDK 11.
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.4.2'
+    }
+}
+
+allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
