@@ -1,0 +1,5 @@
+# yndronix — Play Store listing
+
+A full Linux terminal on your phone — packages, shell, and on-device SSH.
+
+yndronix puts a real, self-contained Linux environment on your Android device. Open a terminal and you get a proper shell, a package manager, and the standard command-line tools you already know — running directly on your phone or tablet, no root and no remote server required. Everything lives in the app's own private storage: install what you need, work with files, scripts, and editors, and remove it all cleanly by uninstalling the app. yndronix can also host an on-device SSH server, so you can drop into a terminal session on your device from a laptop or another machine on your own local network — handy for typing on a real keyboard, copying files, or running longer jobs. There are no accounts, no ads, and no tracking: yndronix collects no personal data, and the network is used only for the package downloads and SSH connections you start yourself. It's built for developers, sysadmins, students, and tinkerers who want a genuine Linux command line in their pocket.
