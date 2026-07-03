@@ -39,6 +39,8 @@ BUNDLE_PACKAGES=(
     runit          # runsvdir / runsv / sv / svlogd -- the supervisor
     openssh        # bin/sshd, ssh-keygen, libexec/sftp-server + sshd-session
     ynss           # LD_PRELOAD shim -> resolve the yndronix user (musl-clean)
+    yndronix-env   # unified profile: one /bin symlinking the whole userland
+    sigsyscatch    # DIAGNOSTIC LD_PRELOAD: report seccomp-blocked syscalls (SIGSYS)
     # shells + base userland
     bash           # login shell + every run-script shebang
     coreutils      # id, mkdir, cat, chmod, head, tr ... used by the scripts
@@ -151,9 +153,19 @@ docker run --rm \
 # kept; the shipped userland stays pure musl.
 musl_bash_dev="${PKG_DEV[bash]}/bin/bash"
 
-# x86-64 store dirs = anything whose ELFs request the x86-64 loader, plus any
+# x86-64 store dirs = anything that CONTAINS a real x86-64 ELF binary, plus any
 # glibc path. (The phone is aarch64; an x86-64 binary here is build-host junk.)
-x86_dirs="$( { grep -rla 'ld-linux-x86-64.so.2' "$BUNDLE_DIR/nix/store" 2>/dev/null || true; \
+# Detect by the ELF header machine field (e_machine == 0x3e / EM_X86_64, at file
+# offset 18), NOT by a content-string match. A `grep 'ld-linux-x86-64.so.2'`
+# false-positives on aarch64 libraries that merely EMBED that loader name as
+# target data: clang's Driver (libclang-cpp.so / libclangDriver.a) hardcodes the
+# dynamic-linker name of every target it can emit for. That wrongly classified
+# clang-lib as build-host junk and deleted it, leaving the device without
+# libclang-cpp.so (clang then fails every relocation at load time). The header
+# check spares such libs while still catching the genuine x86-64 bash + glibc
+# closure. LC_ALL=C forces byte (not UTF-8 character) semantics so `.` spans one
+# byte and \xNN is a raw byte.
+x86_dirs="$( { LC_ALL=C grep -rlaP '^\x7fELF\x02\x01\x01.{11}\x3e\x00' "$BUNDLE_DIR/nix/store" 2>/dev/null || true; \
                ls -d "$BUNDLE_DIR"/nix/store/*glibc* 2>/dev/null || true; } \
     | sed -E "s#^$BUNDLE_DIR/nix/store/([^/]+).*#\1#" | sort -u )"
 
@@ -213,12 +225,17 @@ nss_host_lib="$(find "${PKG_HOST[ynss]}" -name 'libynss.so' -print -quit 2>/dev/
 [ -n "$nss_host_lib" ] || die "libynss.so not found under ${PKG_HOST[ynss]}"
 nss_dev_lib="${nss_host_lib/$STORE_DIR/$PREFIX}"
 
-# Session PATH = every tool package's /bin (on-device paths).
-session_path=""
-for attr in "${PATH_PACKAGES[@]}"; do
-    bindir="${PKG_DEV[$attr]}/bin"
-    session_path="${session_path:+$session_path:}$bindir"
-done
+# sigsyscatch: DIAGNOSTIC LD_PRELOAD that turns a silent seccomp SIGSYS into a
+# printed syscall number (on stderr + a file). Preloaded for sshd while we chase
+# the startup crash; harmless to ship, drop from BUNDLE_PACKAGES once not needed.
+sigsys_host_lib="$(find "${PKG_HOST[sigsyscatch]}" -name 'libsigsyscatch.so' -print -quit 2>/dev/null || true)"
+[ -n "$sigsys_host_lib" ] || die "libsigsyscatch.so not found under ${PKG_HOST[sigsyscatch]}"
+sigsys_dev_lib="${sigsys_host_lib/$STORE_DIR/$PREFIX}"
+
+# Session PATH is ONE entry: the yndronix-env profile symlinks every tool's
+# /bin into a single directory. (Also makes a bare-name exec like "runsv"
+# always resolve -- no dependence on PATH ordering across store paths.)
+session_path="${PKG_DEV[yndronix-env]}/bin"
 
 # --- 4. generate the control plane under svc/ --------------------------------
 # paths.env: fully-substituted, sourced by every script at runtime.
@@ -236,6 +253,7 @@ export RUNSVDIR=$runit/bin/runsvdir
 export SV=$runit/bin/sv
 export SVLOGD=$runit/bin/svlogd
 export NSS_WRAPPER_LIB=$nss_dev_lib
+export SIGSYSCATCH_LIB=$sigsys_dev_lib
 export LOGIN_SHELL=$bash_bin
 export BASH=$bash_bin
 
@@ -326,6 +344,12 @@ nameserver 1.1.1.1
 nameserver 8.8.8.8
 RESOLV
 
+# Record the loader path so ynss can reroute data-dir execs WITHOUT relying
+# on the environment: sshd drops YND_LINKER from the session env before it
+# exec()s the user shell, so ynss reads this file as a fallback.
+echo "${YND_LINKER:-}" > "$YND_RUN/etc/linker"
+echo "yndronix: linker-file=[$(cat \"$YND_RUN/etc/linker\" 2>/dev/null)]"
+
 # Activate ynss for THIS process and every child. ssh-keygen, runsvdir and sshd
 # all call getpwuid()/getpwnam() to resolve the app uid to 'yndronix' -- on
 # Android there is no /etc/passwd, so only ynss answers. (After passwd/group.)
@@ -399,6 +423,12 @@ AuthorizedKeysFile $YND_RUN/home/.ssh/authorized_keys
 Subsystem sftp $SFTP_SERVER
 PrintMotd no
 SetEnv PATH=$PATH
+# sshd builds a sanitized session env that drops YND_LINKER, so ynss could
+# not reroute the data-dir exec of this user shell through the musl loader
+# (Android W^X denies a direct execve of a data-dir file -> EACCES). Push
+# the runtime loader path into the session env so the FIRST session exec
+# (sshd -> login-shell) is rerouted; the shell wrapper re-bakes it after.
+SetEnv YND_LINKER=$YND_LINKER
 SSHD_CONFIG
 
 # --- install/refresh the runit service dirs (keep any live supervise/ state) ---
@@ -429,8 +459,16 @@ chmod 755 "$BUNDLE_DIR/svc/init"
     cat <<'SSHD_RUN'
 exec 2>&1
 . /data/data/com.yndronix/svc/paths.env
+# sigsyscatch is preloaded alongside ynss while we chase the sshd startup crash:
+# a seccomp-blocked syscall is reported ("[sigsyscatch] SIGSYS blocked syscall=N")
+# to stderr instead of a silent kill. sshd's stderr (-e) flows to runsv's logger
+# (svlogd -> run/log/sshd/current); YndService tails that file to logcat, so the
+# abort reason is visible via `adb logcat -s yndronix-sshd` with no root and no
+# debuggable flag. (Do NOT pipe to /system/bin/log here: it is a bionic binary
+# and the inherited musl LD_PRELOAD makes bionic's linker reject it silently.)
 exec env \
-    LD_PRELOAD="$NSS_WRAPPER_LIB" \
+    LD_PRELOAD="$SIGSYSCATCH_LIB:$NSS_WRAPPER_LIB" \
+    SIGSYSCATCH_LOG="$YND_RUN/sigsys.txt" \
     NSS_WRAPPER_PASSWD="$YND_RUN/etc/passwd" \
     NSS_WRAPPER_GROUP="$YND_RUN/etc/group" \
     "$SSHD" -D -e -f "$YND_RUN/etc/sshd_config"

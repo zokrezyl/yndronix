@@ -138,7 +138,53 @@ typedef enum nss_status NSS_STATUS;
     });
   };
 
-  pkgs = import <nixpkgs> { overlays = [ docbookFix treeSitterCross neovimCross nssWrapperMusl zshSortFix ]; };
+  # OpenSSH's privilege separation needs a chroot directory that exists AND is
+  # owned by root and not group/world-writable. In a non-rooted Android app
+  # sandbox we can neither create the default /var/empty nor own anything as
+  # root, so sshd fatally exits at startup ("Missing privilege separation
+  # directory"). Point the compiled privsep path at /system -- an always-present,
+  # root-owned, 0755 directory that satisfies the check. sshd never chroots into
+  # it when running non-root, so the directory is only stat()ed, never entered.
+  opensshPrivsep = self: super: {
+    openssh = super.openssh.overrideAttrs (old: {
+      configureFlags = (old.configureFlags or [ ]) ++ [ "--with-privsep-path=/system" ];
+    });
+  };
+
+  # busybox's cgit patch URLs (git.busybox.net/busybox/patch/?id=...) now 404,
+  # so its two baked archival-CVE patches fail to fetch -- and busybox is a nix
+  # sandbox-shell dependency, so nix won't build. Those CVEs are tar/cpio/unzip
+  # path-traversal fixes in busybox APPLETS, irrelevant to nix's internal
+  # /bin/sh sandbox shell, so drop them; busybox builds cleanly without them.
+  busyboxPatchFix = self: super: {
+    busybox = super.busybox.overrideAttrs (old: {
+      patches = super.lib.filter
+        (p: !(super.lib.hasInfix "CVE-2023-39810" "${p}"
+           || super.lib.hasInfix "CVE-2026-26157" "${p}"))
+        (old.patches or [ ]);
+    });
+  };
+
+  # nix (2.34) cross-built to aarch64-musl fails linking libnixexpr.so: the LTO
+  # codegen pass tries to inline musl fortify-headers' always_inline vsnprintf
+  # (pulled in via std::to_string) and dies -- "function body can be overwritten
+  # at link time". fortify-headers only defines that always_inline wrapper when
+  # _FORTIFY_SOURCE > 0, so drop the fortify hardening flag for every nix-*
+  # component on this target -- the wrapper vanishes and the LTO link succeeds.
+  # base.nix resolves through this nixVersions scope.
+  nixLtoFix = self: super: {
+    nixVersions = super.nixVersions.extend (finalV: prevV: {
+      nixComponents_2_34 = prevV.nixComponents_2_34.overrideScope (finalC: prevC:
+        super.lib.mapAttrs (n: v:
+          if super.lib.isDerivation v && super.lib.hasPrefix "nix-" (v.pname or "")
+          then v.overrideAttrs (o: {
+                 hardeningDisable = (o.hardeningDisable or [ ]) ++ [ "fortify" "fortify3" ];
+               })
+          else v) prevC);
+    });
+  };
+
+  pkgs = import <nixpkgs> { overlays = [ docbookFix treeSitterCross neovimCross nssWrapperMusl zshSortFix opensshPrivsep busyboxPatchFix nixLtoFix ]; };
   # Android target: MUSL, not glibc. Modern glibc makes syscalls (rseq, statx,
   # ...) that Android's app seccomp filter kills with SIGSYS -- a glibc userland
   # cannot start inside a non-rooted app. musl uses the conservative syscalls
@@ -179,8 +225,24 @@ typedef enum nss_status NSS_STATUS;
     buildPhase = "$CC -O2 -o dnstest dnstest.c";
     installPhase = "install -Dm755 dnstest $out/bin/dnstest";
   };
+
+  # yndronix-env: a single profile whose /bin symlinks every userland tool,
+  # so the on-device session PATH is ONE entry instead of a colon-list of
+  # store paths. Each tool is resolved by the SAME attr path build-package
+  # uses, so the closure matches what the bundle already builds.
+  yndronix-env = base.buildEnv {
+    name = "yndronix-env";
+    paths = map (n: pkgs.lib.getAttrFromPath (pkgs.lib.splitString "." n) base) [
+      "coreutils" "bash" "openssh" "runit" "findutils" "gnugrep" "gnused"
+      "less" "which" "tmux" "dnsutils" "neovim" "zsh" "clang"
+      "fzf" "procps" "htop" "file" "tree" "jq" "curl" "wget" "gnutar" "gzip" "git" "ripgrep" "fd" "nix"
+    ];
+    pathsToLink = [ "/bin" "/libexec" ];
+    ignoreCollisions = true;
+  };
 in
   if attr == "ynss" then ynss
   else if attr == "sigsyscatch" then sigsyscatch
   else if attr == "dnstest" then dnstest
+  else if attr == "yndronix-env" then yndronix-env
   else pkgs.lib.getAttrFromPath (pkgs.lib.splitString "." attr) base

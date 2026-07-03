@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <limits.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
 #include <sys/fsuid.h>
@@ -311,6 +312,120 @@ static int yndexec_path_find(const char *file, char *const envp[],
     return 0;
 }
 
+/* Resolve the musl loader path. Normally provided via the YND_LINKER env var
+ * (set by the Android launcher), but sshd sanitizes the session environment and
+ * drops it before exec()-ing the user shell -- so for that exec ynss would see
+ * no loader and fall through to a direct data-dir execve(), which Android W^X
+ * denies (EACCES). init also writes the loader path to a fixed data-dir file;
+ * read it as an env-independent fallback so the reroute always works. */
+static const char *yndexec_loader(void)
+{
+    const char *env = getenv("YND_LINKER");
+    if (env != NULL && env[0] != 0)
+        return env;
+    static char cached[PATH_MAX];
+    static int loaded = 0;
+    if (!loaded) {
+        loaded = 1;
+        char file[PATH_MAX];
+        snprintf(file, sizeof file, "%s/run/etc/linker", yndexec_data_dir());
+        int fd = open(file, O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            ssize_t n = read(fd, cached, sizeof cached - 1);
+            close(fd);
+            if (n > 0) {
+                cached[n] = 0;
+                char *newline = strchr(cached, 10);
+                if (newline != NULL)
+                    *newline = 0;
+            }
+        }
+    }
+    return cached[0] != 0 ? cached : NULL;
+}
+
+/* ---- /proc/self/exe -> the real program (not the loader) ----
+ * Every data-dir binary is run as `libyndld.so --argv0 <argv0> <prog> <args>`,
+ * so the kernel's /proc/self/exe resolves to the loader, and /proc/<pid>/exe
+ * likewise. Tools that re-exec themselves via uv_exepath()/readlink (neovim,
+ * busybox-style multicalls, ...) then launch the loader with their own args and
+ * crash. Recover the real program from /proc/self/cmdline -- the loader leaves
+ * it as `<loader> --argv0 <argv0> <prog> ...`, so <prog> is the real exe. */
+static ssize_t ynd_real_exe(char *buf, size_t bufsiz)
+{
+    int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    char cmd[8192];
+    ssize_t n = read(fd, cmd, sizeof cmd - 1);
+    close(fd);
+    if (n <= 0)
+        return -1;
+    cmd[n] = 0;
+
+    const char *args[6];
+    int argc = 0;
+    char *p = cmd;
+    char *limit = cmd + n;
+    while (p < limit && argc < 6) {
+        args[argc++] = p;
+        p += strlen(p) + 1;
+    }
+    if (argc < 2 || strstr(args[0], "libyndld.so") == NULL)
+        return -1;
+
+    const char *real;
+    if (argc >= 4 && strcmp(args[1], "--argv0") == 0)
+        real = args[3];          /* loader --argv0 <argv0> <prog> ... */
+    else
+        real = args[1];          /* loader <prog> ...                 */
+    if (real == NULL || real[0] == 0)
+        return -1;
+
+    size_t len = strlen(real);
+    if (len > bufsiz)
+        len = bufsiz;
+    memcpy(buf, real, len);
+    return (ssize_t)len;
+}
+
+static int ynd_is_self_exe(const char *path)
+{
+    if (path == NULL)
+        return 0;
+    if (strcmp(path, "/proc/self/exe") == 0)
+        return 1;
+    char self[64];
+    snprintf(self, sizeof self, "/proc/%d/exe", (int)getpid());
+    return strcmp(path, self) == 0;
+}
+
+ssize_t readlink(const char *path, char *buf, size_t bufsiz)
+{
+    static ssize_t (*real)(const char *, char *, size_t);
+    if (real == NULL)
+        real = (ssize_t (*)(const char *, char *, size_t))dlsym(RTLD_NEXT, "readlink");
+    if (ynd_is_self_exe(path)) {
+        ssize_t r = ynd_real_exe(buf, bufsiz);
+        if (r >= 0)
+            return r;
+    }
+    return real(path, buf, bufsiz);
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz)
+{
+    static ssize_t (*real)(int, const char *, char *, size_t);
+    if (real == NULL)
+        real = (ssize_t (*)(int, const char *, char *, size_t))dlsym(RTLD_NEXT, "readlinkat");
+    if (ynd_is_self_exe(path)) {
+        ssize_t r = ynd_real_exe(buf, bufsiz);
+        if (r >= 0)
+            return r;
+    }
+    return real(dirfd, path, buf, bufsiz);
+}
+
 int execve(const char *path, char *const argv[], char *const envp[])
 {
     static int (*real)(const char *, char *const[], char *const[]);
@@ -318,17 +433,49 @@ int execve(const char *path, char *const argv[], char *const envp[])
         real = (int (*)(const char *, char *const[], char *const[]))
             dlsym(RTLD_NEXT, "execve");
 
-    const char *loader = getenv("YND_LINKER");
-    if (loader == NULL || loader[0] == '\0' || !yndexec_under_data_dir(path) ||
-        strcmp(path, loader) == 0)
+    const char *loader = yndexec_loader();
+    if (loader == NULL || loader[0] == '\0')
         return real(path, argv, envp);
+
+    /* Resolve a relative path against the current directory before the data-dir
+     * test. runit's runsv chdir()s into a service directory under the data dir
+     * and exec()s the service script by the RELATIVE name "./run" (likewise
+     * "./finish" and "./log/run"). Without resolving it here the path fails the
+     * absolute-only data-dir check, falls through to the real execve(), and
+     * Android 10+ (targetSdk >= 29) denies execve() of an app-data-dir file --
+     * so every supervised service (sshd included) fails to start. */
+    char resolved[PATH_MAX];
+    const char *target = path;
+    if (path[0] != '/') {
+        char cwd[PATH_MAX];
+        if (getcwd(cwd, sizeof cwd) != NULL) {
+            int written = snprintf(resolved, sizeof resolved, "%s/%s", cwd, path);
+            if (written > 0 && (size_t)written < sizeof resolved)
+                target = resolved;
+        }
+    }
+
+    if (!yndexec_under_data_dir(target) || strcmp(target, loader) == 0)
+        return real(path, argv, envp);
+
+    /* The kernel returns ENOENT when execve()'s target is missing, and
+     * execvp()/execlp() rely on that to advance to the next PATH directory.
+     * Our rewrite would instead exec the (always-present) loader and only fail
+     * AFTER the exec succeeded -- so a missing target aborts the loader and the
+     * PATH search never reaches the directory that actually holds the binary
+     * (e.g. "runsv": absent from coreutils/bin = PATH[0], present in runit/bin).
+     * Mirror the kernel: if the target is missing, fail with ENOENT here. */
+    if (compat_access(AT_FDCWD, target, F_OK) != 0) {
+        errno = ENOENT;
+        return -1;
+    }
 
     char interp[512], argument[512];
     size_t capacity = yndexec_argv_count(argv) + 8;
     char **rewritten = (char **)calloc(capacity, sizeof *rewritten);
     if (rewritten == NULL)
         return real(path, argv, envp);
-    const char *program = yndexec_build_rewrite(loader, path, argv, rewritten,
+    const char *program = yndexec_build_rewrite(loader, target, argv, rewritten,
                                                 interp, sizeof interp,
                                                 argument, sizeof argument);
     int rc = real(program, rewritten, envp);
@@ -439,7 +586,7 @@ int execle(const char *path, const char *arg0, ...)
 
 int fexecve(int fd, char *const argv[], char *const envp[])
 {
-    const char *loader = getenv("YND_LINKER");
+    const char *loader = yndexec_loader();
     if (loader != NULL && loader[0] != '\0') {
         char link[64], target[4096];
         snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
@@ -469,10 +616,15 @@ int posix_spawn(pid_t *pid, const char *path,
                         const posix_spawnattr_t *, char *const[], char *const[]))
             dlsym(RTLD_NEXT, "posix_spawn");
 
-    const char *loader = getenv("YND_LINKER");
+    const char *loader = yndexec_loader();
     if (loader == NULL || loader[0] == '\0' || !yndexec_under_data_dir(path) ||
         strcmp(path, loader) == 0)
         return real(pid, path, file_actions, attributes, argv, envp);
+
+    /* Same missing-target guard as execve(): a would-be ENOENT must not become
+     * a successful loader exec, or posix_spawnp()'s PATH fallback breaks. */
+    if (compat_access(AT_FDCWD, path, F_OK) != 0)
+        return ENOENT;
 
     char interp[512], argument[512];
     size_t capacity = yndexec_argv_count(argv) + 8;

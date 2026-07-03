@@ -1,0 +1,25 @@
+# Relocated Nix store (the bind-mounted on-device /data/data/.../nix tree)
+/nixroot/
+# Convenience symlinks to built packages
+/out/
+# Persisted nix HOME cache (URL->store-path map + tarball/git cache)
+/.nixcache/
+# Build/run logs
+/tmp/
+# Deployable Android service bundle (closure + runit control plane)
+/bundle/
+# local ssh test keypair (do not commit)
+/yndronix_test_ed25519
+/yndronix_test_ed25519.pub
+# Android wrapper build outputs + baked store asset
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/assets/store.tar.br
+# glibc loader copied into jniLibs by make-apk-assets (nativeLibraryDir entry)
+/android/app/src/main/jniLibs/
+# release signing config + keystore (never commit)
+/android/keystore.properties
+/android/*.keystore
+/android/*.jks

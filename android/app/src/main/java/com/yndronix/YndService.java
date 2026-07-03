@@ -14,6 +14,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 
 /**
  * Foreground service that owns the supervisor process. Android 10+ forbids
@@ -48,6 +49,11 @@ public class YndService extends Service {
     private void runInit() {
         try {
             File dataDir = new File(getApplicationInfo().dataDir);
+            // DIAGNOSTIC: the supervisor's logs live in the app's 0700 data dir,
+            // unreadable by adb on a non-debuggable, non-rooted build. We run as
+            // the app uid, so tail them here and echo to logcat (adb logcat -s
+            // yndronix-sshd). Remove once sshd is healthy.
+            startLogTailer(dataDir);
             File init = new File(dataDir, "svc/init");
             File home = new File(dataDir, "run/home");
             // noinspection ResultOfMethodCallIgnored
@@ -92,6 +98,63 @@ public class YndService extends Service {
         } catch (Exception e) {
             Log.e(TAG, "failed to start supervisor", e);
         }
+    }
+
+    /**
+     * DIAGNOSTIC: tail the supervisor's log files (which live in the app's 0700
+     * data dir) and mirror new lines to logcat under the "yndronix-sshd" tag, so
+     * the sshd startup failure is visible via `adb logcat` without root or a
+     * debuggable build. Echoes boot.log, the svlogd sshd log, and the sigsyscatch
+     * report. Runs for the lifetime of the service. Remove once sshd is healthy.
+     */
+    private void startLogTailer(File dataDir) {
+        final File[] logs = {
+                new File(dataDir, "run/boot.log"),
+                new File(dataDir, "run/log/sshd/current"),
+                new File(dataDir, "run/sigsys.txt"),
+        };
+        new Thread(() -> {
+            long[] offsets = new long[logs.length];
+            byte[] buffer = new byte[8192];
+            while (!Thread.currentThread().isInterrupted()) {
+                for (int index = 0; index < logs.length; index++) {
+                    File file = logs[index];
+                    try {
+                        if (!file.exists()) {
+                            continue;
+                        }
+                        long length = file.length();
+                        if (length < offsets[index]) {
+                            offsets[index] = 0; // truncated/rotated
+                        }
+                        if (length <= offsets[index]) {
+                            continue;
+                        }
+                        try (RandomAccessFile reader = new RandomAccessFile(file, "r")) {
+                            reader.seek(offsets[index]);
+                            StringBuilder collected = new StringBuilder();
+                            int read;
+                            while ((read = reader.read(buffer)) > 0) {
+                                collected.append(new String(buffer, 0, read));
+                            }
+                            offsets[index] = reader.getFilePointer();
+                            for (String line : collected.toString().split("\n", -1)) {
+                                if (!line.isEmpty()) {
+                                    Log.i("yndronix-sshd", file.getName() + ": " + line);
+                                }
+                            }
+                        }
+                    } catch (Exception e) {
+                        // best-effort diagnostic; retry on the next pass
+                    }
+                }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+        }, "yndronix-logtail").start();
     }
 
     /** Reads a single KEY=VALUE entry from the bundle's svc/launch.env. */
