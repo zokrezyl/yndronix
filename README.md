@@ -3,6 +3,11 @@
 **A real Linux userland on Android — running natively, with no root, no VM, and
 no `ptrace`/`proot` syscall emulation.**
 
+yndronix was written to provide *yet another* OS-like runtime environment — this
+one on **Android** — for [yetty](https://github.com/zokrezyl/yetty) (a
+GPU-accelerated terminal and rich-content runtime) and for the apps that run on
+top of the yetty terminal. It is one such runtime; **YOS** is another.
+
 yndronix puts a full, self-contained Linux command line on your phone or tablet:
 a proper shell, the standard GNU/BSD tools you already know, an on-device SSH
 server, and a package set built straight from [nixpkgs](https://github.com/NixOS/nixpkgs).
