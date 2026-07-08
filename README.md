@@ -9,9 +9,10 @@ server, and a package set built straight from [nixpkgs](https://github.com/NixOS
 Everything lives in the app's own private storage, needs no root, and uninstalls
 cleanly.
 
-It is also the base operating layer for **yetty OS** — the self-contained Linux
-foundation that the [yetty](https://github.com/zokrezyl/yetty) GPU terminal runs
-on top of.
+It is also a basic OS-like environment for **yetty OS (YOS)** — the platform for
+distributing **"build once, run everywhere"** apps built on the
+[yetty](https://github.com/zokrezyl/yetty) terminal's features. See
+[yndronix and yetty OS](#yndronix-and-yetty-os) below.
 
 ---
 
@@ -110,11 +111,18 @@ a mainstream package tree, running as fast as the hardware allows.
 
 ## yndronix and yetty OS
 
-yndronix is the **base OS layer for yetty OS**. yetty is a GPU-accelerated
-terminal that renders rich content — plots, images, video, GUIs — alongside
-text; yndronix is the self-contained Linux userland it stands on when it runs on
-Android. In other words, yndronix is the rootfs/runtime foundation, and yetty is
-the interface and application surface built on top of it.
+yndronix is a **basic OS-like environment for yetty OS (YOS)**.
+
+YOS was written to distribute **"build once, run everywhere" apps** —
+applications built on the yetty terminal's features, packaged so they run
+anywhere yetty runs, from a single build. To make that work, YOS provides a
+basic, self-contained OS-like environment underneath those apps in each place it
+runs — including **yetty in the browser**.
+
+yndronix is that environment on Android: the self-contained Linux userland a
+yetty app can rely on being present, delivered without root, without a VM, and
+without syscall emulation. It is the substrate YOS apps run *in*, not something
+layered on top of yetty.
 
 ---
 
