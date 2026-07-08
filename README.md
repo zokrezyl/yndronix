@@ -9,10 +9,12 @@ server, and a package set built straight from [nixpkgs](https://github.com/NixOS
 Everything lives in the app's own private storage, needs no root, and uninstalls
 cleanly.
 
-It is also a basic OS-like environment for **yetty OS (YOS)** — the platform for
-distributing **"build once, run everywhere"** apps built on the
-[yetty](https://github.com/zokrezyl/yetty) terminal's features. See
-[yndronix and yetty OS](#yndronix-and-yetty-os) below.
+> ### 📱 In testing on Google Play — we're looking for testers
+>
+> yndronix is available as a testing release on Google Play, and we'd love your
+> help shaping it. Join the testing program, try it on your device, and share
+> feedback in the
+> **[testers discussion (#10)](https://github.com/zokrezyl/yndronix/discussions/10)**.
 
 ---
 
@@ -83,89 +85,19 @@ a mainstream package tree, running as fast as the hardware allows.
 
 ## How it works
 
-1. **Reproducible closures.** The whole userland is a Nix closure —
-   declarative, content-addressed, and free of imperative package-database
-   drift. `bootstrap/docker/build.nix` defines the package set and the handful
-   of overlays needed to cross-compile it cleanly to aarch64-musl.
-
-2. **Relocated Nix store.** Packages are built with the on-device store prefix
-   `/data/data/com.yndronix/nix` baked into every store-path hash, so the tree
-   is fully self-contained and needs no `nix` daemon to *run*. The store ships
-   as an app asset and unpacks into the app's private directory.
-
-3. **Cross-compiled off-device.** An x86_64 host builds the aarch64-musl closure
-   inside a Docker container via `nixpkgs` `pkgsCross`
-   (`build-tools/build-package --android <attr>`).
-
-4. **Launched through a musl loader.** Android 10+ forbids `execve()` of files in
-   the app data dir, so store binaries are started through a musl loader shipped
-   in `nativeLibraryDir` (`libyndld.so`), which `mmap`s them instead. `ynss` then
-   transparently reroutes any further data-dir `exec` back through the loader.
-
-5. **Supervised services.** A `runit` control plane (built by
-   `build-tools/make-service-bundle`) supervises `sshd`; a first-launch `init`
-   synthesizes the user database, generates host keys, and installs the baked
-   `authorized_keys`.
-
----
-
-## yndronix and yetty OS
-
-yndronix is a **basic OS-like environment for yetty OS (YOS)**.
-
-YOS was written to distribute **"build once, run everywhere" apps** —
-applications built on the yetty terminal's features, packaged so they run
-anywhere yetty runs, from a single build. To make that work, YOS provides a
-basic, self-contained OS-like environment underneath those apps in each place it
-runs — including **yetty in the browser**.
-
-yndronix is that environment on Android: the self-contained Linux userland a
-yetty app can rely on being present, delivered without root, without a VM, and
-without syscall emulation. It is the substrate YOS apps run *in*, not something
-layered on top of yetty.
-
----
-
-## Repository layout
-
-```
-bootstrap/
-  docker/build.nix       package set + cross-compile overlays (the source of truth)
-  docker/Dockerfile      the nix build container
-  ynss/ynss.c            LD_PRELOAD: NSS lookups + Android/musl seccomp compat shims
-  sigsyscatch/           LD_PRELOAD: report seccomp-blocked syscalls (diagnostic)
-  dnstest/               getaddrinfo() exerciser for the ynss DNS path (diagnostic)
-build-tools/
-  build-package          build one nixpkgs attr (native or --android) into ./nixroot
-  make-service-bundle    extract the runtime closure + generate the runit control plane
-  make-apk-assets        pack the store + loader into the Android app assets
-  build-release-aab.sh   assemble and sign the Play Store bundle
-android/                 the thin Android wrapper app (store extraction, launcher, UI)
-docs/                    listing description and privacy policy
-```
-
-## Building
-
-Prerequisites: Docker (for the reproducible nix build container).
-
-```sh
-# 1. Build the nix build image (once).
-docker build -t yndronix-build bootstrap/docker
-
-# 2. Build packages for the phone (aarch64-musl), e.g.:
-build-tools/build-package --android bash
-build-tools/build-package --android openssh
-
-# 3. Assemble the on-device bundle (runtime closure + runit control plane).
-build-tools/make-service-bundle
-
-# 4. Pack the app assets and build the signed release bundle.
-build-tools/make-apk-assets
-build-tools/build-release-aab.sh
-```
-
-Built store paths land under `./nixroot/store`, with convenience symlinks in
-`./out`. See the comments at the top of each script for the details.
+- **Reproducible closures.** The whole userland is a Nix closure — declarative,
+  content-addressed, and free of imperative package-database drift — cross-built
+  to aarch64-musl.
+- **Relocated Nix store.** Every store-path hash is baked with the on-device
+  store prefix, so the tree is fully self-contained and needs no `nix` daemon to
+  *run*. It ships inside the app and unpacks into the app's private storage.
+- **Launched through a musl loader.** Android 10+ forbids `execve()` of files in
+  the app data dir, so store binaries are started through a musl loader shipped
+  in `nativeLibraryDir`, which `mmap`s them instead. `ynss` then transparently
+  reroutes any further data-dir `exec` back through the loader.
+- **Supervised services.** A `runit` control plane supervises `sshd`; a
+  first-launch `init` synthesizes the user database, generates host keys, and
+  installs the baked `authorized_keys`.
 
 ---
 
@@ -174,3 +106,11 @@ Built store paths land under `./nixroot/store`, with convenience symlinks in
 yndronix collects no personal data — no analytics, no ads, no accounts. All
 state lives in the app's private storage and is removed on uninstall. Full
 policy: [docs/PRIVACY.md](docs/PRIVACY.md).
+
+## License
+
+yndronix is licensed under the **Business Source License 1.1** — the same
+license as [yetty](https://github.com/zokrezyl/yetty). Non-production use is
+free; production use requires a commercial license, and the license converts to
+GPL v2-or-later on the Change Date. Bundled third-party components (the
+nixpkgs-built userland) keep their own upstream licenses. See [LICENSE](LICENSE).
