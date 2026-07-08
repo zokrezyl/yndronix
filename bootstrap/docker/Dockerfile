@@ -34,16 +34,22 @@ ENV NIX_LOG_DIR=${YNDRONIX_PREFIX}/var/log/nix
 # Operate the local store directly; the daemon only understands /nix/store.
 ENV NIX_REMOTE=
 
-# nixpkgs channel = nixos-26.05 (latest release; docbook already fixed -> oasis).
-# 26.05's stdenv uses the FULL-SOURCE bootstrap, whose seed
-# (stage0-posix / make-minimal-bootstrap-sources) is a fixed-output derivation.
-# With the relocated store the binary cache is unusable -- FOD substitution is
-# path-keyed and store-dir-dependent (verified: even with cache.nixos.org
-# enabled, FODs do not substitute into a relocated store). So the seed is
-# INJECTED out-of-band (built where the cache works, then `nix-store --add-fixed`
-# into the relocated store); after that the full-source bootstrap compiles the
-# toolchain from source. Override: --build-arg NIXPKGS_REF=<ref>
-ARG NIXPKGS_REF=nixos-26.05
+# nixpkgs is PINNED to an exact commit (nixos-26.05 @ 2026-06-11), NOT the
+# moving branch -- reproducible release builds and audits need a fixed revision,
+# and the relocated store cannot use the binary cache (every path hash differs),
+# so an unpinned branch would silently change the whole closure. The canonical
+# pin lives in nix/nixpkgs.nix, which the package eval reads directly; the
+# NIX_PATH below is kept in sync only so an interactive `<nixpkgs>` in the
+# container matches. Keep this ARG equal to the rev in nix/nixpkgs.nix.
+#
+# 26.05's stdenv uses the FULL-SOURCE bootstrap, whose seed (stage0-posix /
+# make-minimal-bootstrap-sources) is a fixed-output derivation. With the
+# relocated store the binary cache is unusable -- FOD substitution is path-keyed
+# and store-dir-dependent (verified: even with cache.nixos.org enabled, FODs do
+# not substitute into a relocated store). So the seed is INJECTED out-of-band
+# (built where the cache works, then `nix-store --add-fixed` into the relocated
+# store); after that the full-source bootstrap compiles the toolchain from source.
+ARG NIXPKGS_REF=a0374025a863d007d98e3297f6aa46cc3141c2f0
 ENV NIX_PATH=nixpkgs=https://github.com/NixOS/nixpkgs/archive/${NIXPKGS_REF}.tar.gz
 
 # No extra host tooling needed: the base image already has nix, a shell and

@@ -119,7 +119,7 @@ cp "$SRC/assets/store.tar.br"            "$B/pack/assets/store.tar.br"
 
 echo ">> [5/7] bundletool build-bundle -> $OUT/yndronix.aab"
 cat > "$B/BundleConfig.json" <<'JSON'
-{ "compression": { "uncompressedGlob": ["assets/**.br", "lib/**/libyndld.so"] } }
+{ "compression": { "uncompressedGlob": ["assets/**.br"] } }
 JSON
 rm -f "$OUT/yndronix.aab"
 java -jar "$BUNDLETOOL" build-bundle \

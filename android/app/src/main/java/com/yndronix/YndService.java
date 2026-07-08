@@ -5,6 +5,7 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.ApplicationInfo;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
@@ -49,11 +50,15 @@ public class YndService extends Service {
     private void runInit() {
         try {
             File dataDir = new File(getApplicationInfo().dataDir);
-            // DIAGNOSTIC: the supervisor's logs live in the app's 0700 data dir,
-            // unreadable by adb on a non-debuggable, non-rooted build. We run as
-            // the app uid, so tail them here and echo to logcat (adb logcat -s
-            // yndronix-sshd). Remove once sshd is healthy.
-            startLogTailer(dataDir);
+            // DIAGNOSTIC (debug builds only): the supervisor's logs live in the
+            // app's 0700 data dir, unreadable by adb on a non-debuggable,
+            // non-rooted build. We run as the app uid, so on a debuggable build
+            // tail them here and echo to logcat (adb logcat -s yndronix-sshd).
+            // Gated on FLAG_DEBUGGABLE so release builds never mirror private
+            // service logs to logcat.
+            if ((getApplicationInfo().flags & ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+                startLogTailer(dataDir);
+            }
             File init = new File(dataDir, "svc/init");
             File home = new File(dataDir, "run/home");
             // noinspection ResultOfMethodCallIgnored
@@ -104,14 +109,14 @@ public class YndService extends Service {
      * DIAGNOSTIC: tail the supervisor's log files (which live in the app's 0700
      * data dir) and mirror new lines to logcat under the "yndronix-sshd" tag, so
      * the sshd startup failure is visible via `adb logcat` without root or a
-     * debuggable build. Echoes boot.log, the svlogd sshd log, and the sigsyscatch
-     * report. Runs for the lifetime of the service. Remove once sshd is healthy.
+     * debuggable build. Echoes boot.log and the svlogd sshd log. Runs for the
+     * lifetime of the service. Only invoked on FLAG_DEBUGGABLE builds -- release
+     * builds must not mirror private service logs to logcat.
      */
     private void startLogTailer(File dataDir) {
         final File[] logs = {
                 new File(dataDir, "run/boot.log"),
                 new File(dataDir, "run/log/sshd/current"),
-                new File(dataDir, "run/sigsys.txt"),
         };
         new Thread(() -> {
             long[] offsets = new long[logs.length];

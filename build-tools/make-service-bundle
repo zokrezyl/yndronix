@@ -40,7 +40,6 @@ BUNDLE_PACKAGES=(
     openssh        # bin/sshd, ssh-keygen, libexec/sftp-server + sshd-session
     ynss           # LD_PRELOAD shim -> resolve the yndronix user (musl-clean)
     yndronix-env   # unified profile: one /bin symlinking the whole userland
-    sigsyscatch    # DIAGNOSTIC LD_PRELOAD: report seccomp-blocked syscalls (SIGSYS)
     # shells + base userland
     bash           # login shell + every run-script shebang
     coreutils      # id, mkdir, cat, chmod, head, tr ... used by the scripts
@@ -225,13 +224,6 @@ nss_host_lib="$(find "${PKG_HOST[ynss]}" -name 'libynss.so' -print -quit 2>/dev/
 [ -n "$nss_host_lib" ] || die "libynss.so not found under ${PKG_HOST[ynss]}"
 nss_dev_lib="${nss_host_lib/$STORE_DIR/$PREFIX}"
 
-# sigsyscatch: DIAGNOSTIC LD_PRELOAD that turns a silent seccomp SIGSYS into a
-# printed syscall number (on stderr + a file). Preloaded for sshd while we chase
-# the startup crash; harmless to ship, drop from BUNDLE_PACKAGES once not needed.
-sigsys_host_lib="$(find "${PKG_HOST[sigsyscatch]}" -name 'libsigsyscatch.so' -print -quit 2>/dev/null || true)"
-[ -n "$sigsys_host_lib" ] || die "libsigsyscatch.so not found under ${PKG_HOST[sigsyscatch]}"
-sigsys_dev_lib="${sigsys_host_lib/$STORE_DIR/$PREFIX}"
-
 # Session PATH is ONE entry: the yndronix-env profile symlinks every tool's
 # /bin into a single directory. (Also makes a bare-name exec like "runsv"
 # always resolve -- no dependence on PATH ordering across store paths.)
@@ -253,7 +245,6 @@ export RUNSVDIR=$runit/bin/runsvdir
 export SV=$runit/bin/sv
 export SVLOGD=$runit/bin/svlogd
 export NSS_WRAPPER_LIB=$nss_dev_lib
-export SIGSYSCATCH_LIB=$sigsys_dev_lib
 export LOGIN_SHELL=$bash_bin
 export BASH=$bash_bin
 
@@ -459,16 +450,12 @@ chmod 755 "$BUNDLE_DIR/svc/init"
     cat <<'SSHD_RUN'
 exec 2>&1
 . /data/data/com.yndronix/svc/paths.env
-# sigsyscatch is preloaded alongside ynss while we chase the sshd startup crash:
-# a seccomp-blocked syscall is reported ("[sigsyscatch] SIGSYS blocked syscall=N")
-# to stderr instead of a silent kill. sshd's stderr (-e) flows to runsv's logger
-# (svlogd -> run/log/sshd/current); YndService tails that file to logcat, so the
-# abort reason is visible via `adb logcat -s yndronix-sshd` with no root and no
-# debuggable flag. (Do NOT pipe to /system/bin/log here: it is a bionic binary
-# and the inherited musl LD_PRELOAD makes bionic's linker reject it silently.)
+# sshd runs under the ynss compat preload (musl getpw*/getgr* + Android syscall
+# shims). Its stderr (-e) flows to runsv's logger (svlogd -> run/log/sshd/current).
+# (Do NOT pipe to /system/bin/log here: it is a bionic binary and the inherited
+# musl LD_PRELOAD makes bionic's linker reject it silently.)
 exec env \
-    LD_PRELOAD="$SIGSYSCATCH_LIB:$NSS_WRAPPER_LIB" \
-    SIGSYSCATCH_LOG="$YND_RUN/sigsys.txt" \
+    LD_PRELOAD="$NSS_WRAPPER_LIB" \
     NSS_WRAPPER_PASSWD="$YND_RUN/etc/passwd" \
     NSS_WRAPPER_GROUP="$YND_RUN/etc/group" \
     "$SSHD" -D -e -f "$YND_RUN/etc/sshd_config"
